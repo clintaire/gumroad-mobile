@@ -8,9 +8,10 @@ import { useAddRecentPurchase } from "@/components/library/use-recent-products";
 import { useAudioPlayerSync } from "@/components/use-audio-player-sync";
 import { useAuth } from "@/lib/auth-context";
 import { env } from "@/lib/env";
+import { cacheFileDestination } from "@/lib/file-utils";
 import { safeOpenURL } from "@/lib/open-url";
 import { buildApiUrl } from "@/lib/request";
-import { File, Paths } from "expo-file-system";
+import { File } from "expo-file-system";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as Sharing from "expo-sharing";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -47,8 +48,8 @@ type TocDataMessage = {
 const downloadUrl = (token: string, productFileId: string) =>
   buildApiUrl(`/mobile/url_redirects/download/${token}/${productFileId}`);
 
-const downloadFile = (token: string, productFileId: string) =>
-  File.downloadFileAsync(downloadUrl(token, productFileId), Paths.cache, {
+const downloadFile = (token: string, productFileId: string, fileName: string) =>
+  File.downloadFileAsync(downloadUrl(token, productFileId), cacheFileDestination(productFileId, fileName), {
     idempotent: true,
   });
 
@@ -185,7 +186,14 @@ export default function DownloadScreen() {
       }
 
       setIsDownloading(true);
-      const downloadedFile = await downloadFile(token, message.payload.resourceId);
+      const fallbackName = message.payload.extension
+        ? `${message.payload.resourceId}.${message.payload.extension.toLowerCase()}`
+        : message.payload.resourceId;
+      const downloadedFile = await downloadFile(
+        token,
+        message.payload.resourceId,
+        fileData?.name ?? fallbackName,
+      );
       await shareFile(downloadedFile.uri);
     } catch (error) {
       console.error("Download failed:", error, data);
