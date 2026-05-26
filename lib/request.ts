@@ -1,12 +1,19 @@
 import { env } from "@/lib/env";
+import * as Sentry from "@sentry/react-native";
 import { useQuery, UseQueryOptions } from "@tanstack/react-query";
-import { useEffect } from "react";
 import { assertDefined } from "./assert";
 import { useAuth } from "./auth-context";
 export class UnauthorizedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "UnauthorizedError";
+  }
+}
+
+export class KeychainUnavailableError extends Error {
+  constructor() {
+    super("Keychain unavailable");
+    this.name = "KeychainUnavailableError";
   }
 }
 
@@ -80,17 +87,35 @@ export const requestAPI = async <T>(
 export const useAPIRequest = <TResponse, TData = TResponse>(
   options: Omit<UseQueryOptions<TResponse, Error, TData>, "queryFn"> & { url: string },
 ) => {
-  const { accessToken, logout, isLoading: isAuthLoading } = useAuth();
+  const { accessToken, refreshToken, logout } = useAuth();
 
-  const query = useQuery<TResponse, Error, TData>({
-    queryFn: () => requestAPI<TResponse>(options.url, { accessToken: assertDefined(accessToken) }),
+  return useQuery<TResponse, Error, TData>({
+    queryFn: async () => {
+      try {
+        return await requestAPI<TResponse>(options.url, { accessToken: assertDefined(accessToken) });
+      } catch (error) {
+        if (!(error instanceof UnauthorizedError)) throw error;
+        let newAccessToken: string;
+        try {
+          newAccessToken = await refreshToken();
+        } catch (refreshError) {
+          if (refreshError instanceof KeychainUnavailableError) throw error;
+          Sentry.captureException(refreshError, { tags: { auth_path: "refresh_failed" } });
+          await logout();
+          throw error;
+        }
+        return await requestAPI<TResponse>(options.url, { accessToken: newAccessToken });
+      }
+    },
     ...options,
+    retry: (failureCount, error) => {
+      if (error instanceof UnauthorizedError) return false;
+      const callerRetry = options.retry;
+      if (callerRetry === undefined) return failureCount < 2;
+      if (typeof callerRetry === "boolean") return callerRetry;
+      if (typeof callerRetry === "number") return failureCount < callerRetry;
+      return callerRetry(failureCount, error);
+    },
     enabled: !!accessToken && (options.enabled ?? true),
   });
-
-  useEffect(() => {
-    if (query.error instanceof UnauthorizedError) logout();
-  }, [query.error, logout]);
-
-  return query;
 };

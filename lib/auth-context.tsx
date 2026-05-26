@@ -1,13 +1,13 @@
 import { assertDefined } from "@/lib/assert";
 import { queryClient } from "@/lib/query-client";
 import { env } from "@/lib/env";
-import { request, UnauthorizedError } from "@/lib/request";
+import { KeychainUnavailableError, request, UnauthorizedError } from "@/lib/request";
 import * as Sentry from "@sentry/react-native";
 import * as AuthSession from "expo-auth-session";
 import { useRouter } from "expo-router";
 import * as SecureStore from "expo-secure-store";
 import * as WebBrowser from "expo-web-browser";
-import React, { createContext, ReactNode, useCallback, useContext, useEffect, useState } from "react";
+import React, { createContext, ReactNode, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Alert } from "react-native";
 
 const authorizationEndpoint = `${env.EXPO_PUBLIC_GUMROAD_URL}/oauth/mobile_pre_authorization/new`;
@@ -27,7 +27,7 @@ interface AuthContextType {
   accessToken: string | null;
   login: () => Promise<void>;
   logout: () => Promise<void>;
-  refreshToken: () => Promise<void>;
+  refreshToken: () => Promise<string>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -56,13 +56,20 @@ const fetchCreatorStatus = async (token: string): Promise<boolean> => {
   }
 };
 
+const secureStoreOptions: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK,
+};
+
 const isKeychainUnavailableError = (error: unknown): boolean =>
-  error instanceof Error && error.message.includes("User interaction is not allowed");
+  error instanceof Error &&
+  (error.message.includes("User interaction is not allowed") ||
+    error.message.includes("No keychain is available"));
 
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [isCreator, setIsCreator] = useState(false);
+  const inflightRefresh = useRef<Promise<string> | null>(null);
   const router = useRouter();
 
   const redirectUri = AuthSession.makeRedirectUri({ scheme: "gumroadmobile" });
@@ -105,8 +112,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const storeTokens = useCallback(async (accessToken: string, refreshToken?: string) => {
-    await SecureStore.setItemAsync(accessTokenKey, accessToken);
-    if (refreshToken) await SecureStore.setItemAsync(refreshTokenKey, refreshToken);
+    await SecureStore.deleteItemAsync(accessTokenKey);
+    await SecureStore.setItemAsync(accessTokenKey, accessToken, secureStoreOptions);
+    if (refreshToken) {
+      await SecureStore.deleteItemAsync(refreshTokenKey);
+      await SecureStore.setItemAsync(refreshTokenKey, refreshToken, secureStoreOptions);
+    }
     setAccessToken(accessToken);
   }, []);
 
@@ -175,30 +186,37 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
   }, [router]);
 
-  const refreshTokenFn = useCallback(async () => {
-    try {
-      const storedRefreshToken = await SecureStore.getItemAsync(refreshTokenKey);
-      if (!storedRefreshToken) throw new Error("No refresh token available");
+  const refreshTokenFn = useCallback(async (): Promise<string> => {
+    if (inflightRefresh.current) return inflightRefresh.current;
 
-      const tokenResponse = await request<{ access_token: string; refresh_token?: string }>(tokenEndpoint, {
-        method: "POST",
-        data: {
-          grant_type: "refresh_token",
-          refresh_token: storedRefreshToken,
-          client_id: env.EXPO_PUBLIC_GUMROAD_CLIENT_ID,
-        },
-      });
-      await storeTokens(tokenResponse.access_token, tokenResponse.refresh_token);
-    } catch (error) {
-      if (isKeychainUnavailableError(error)) {
-        console.warn("Keychain unavailable (device may be locked):", error);
-        return;
+    inflightRefresh.current = (async () => {
+      try {
+        let storedRefreshToken: string | null;
+        try {
+          storedRefreshToken = await SecureStore.getItemAsync(refreshTokenKey);
+        } catch (readError) {
+          if (isKeychainUnavailableError(readError)) throw new KeychainUnavailableError();
+          throw readError;
+        }
+        if (!storedRefreshToken) throw new Error("No refresh token available");
+
+        const tokenResponse = await request<{ access_token: string; refresh_token?: string }>(tokenEndpoint, {
+          method: "POST",
+          data: {
+            grant_type: "refresh_token",
+            refresh_token: storedRefreshToken,
+            client_id: env.EXPO_PUBLIC_GUMROAD_CLIENT_ID,
+          },
+        });
+        await storeTokens(tokenResponse.access_token, tokenResponse.refresh_token);
+        return tokenResponse.access_token;
+      } finally {
+        inflightRefresh.current = null;
       }
-      console.error("Failed to refresh token:", error);
-      Sentry.captureException(error);
-      await logout();
-    }
-  }, [logout, storeTokens]);
+    })();
+
+    return inflightRefresh.current;
+  }, [storeTokens]);
 
   return (
     <AuthContext.Provider
